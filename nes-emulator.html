@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>NES エミュレータ</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+:root{--bg:#eef0f3;--fg:#1b1e24;--mut:#5d6573;--ac:#c8102e;--sf:#fff;--bd:#c5cbd4;color-scheme:light dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#15181d;--fg:#e7e9ee;--mut:#9aa3b2;--sf:#1e2229;--bd:#363d49}}
+:root[data-theme="dark"]{--bg:#15181d;--fg:#e7e9ee;--mut:#9aa3b2;--sf:#1e2229;--bd:#363d49}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.6 "Hiragino Sans","Noto Sans JP","Yu Gothic",sans-serif}
+main{max-width:800px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:1.4rem;margin:0 0 14px;border-left:6px solid var(--ac);padding-left:10px}
+canvas{display:block;width:100%;max-width:768px;aspect-ratio:256/240;image-rendering:pixelated;background:#000;border:3px solid var(--fg);border-radius:6px}
+.drop{display:block;margin:0 0 14px;padding:14px;border:2px dashed var(--bd);border-radius:8px;background:var(--sf);cursor:pointer;text-align:center}
+.drop.on{border-color:var(--ac)}
+#m{color:var(--mut);margin:10px 0;min-height:1.6em}
+.tb{display:flex;gap:8px;margin:0 0 10px}.tb button{font:inherit;padding:4px 16px;border:2px solid var(--bd);border-radius:6px;background:var(--sf);color:var(--fg);cursor:pointer}.tb button[aria-pressed=true]{border-color:var(--ac)}#d{display:none;cursor:grab;touch-action:none;image-rendering:auto}#i{color:var(--mut);font-size:.9rem;margin:8px 0}
+dl{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;color:var(--mut);font-size:.9rem;margin:0}
+dt{color:var(--fg)}dd{margin:0}
+</style>
+</head>
+<body>
+<main>
+<h1>NES エミュレータ</h1>
+<label class="drop" id="dz">.nes ファイルをここにドロップ、またはクリックして選択<input id="f" type="file" accept=".nes" hidden></label>
+<div class="tb"><button id="b2" aria-pressed="true">2D 表示</button><button id="b3" aria-pressed="false">3D 表示</button><button id="bm" aria-pressed="true">音 ON</button></div>
+<canvas id="s" width="256" height="240"></canvas>
+<canvas id="d" width="768" height="720"></canvas>
+<p id="i">ROM 情報: 未読み込み。3D 表示はドラッグで回転、ホイールで拡大縮小できます。</p>
+<p id="m">ROM を読み込むとすぐ始まります。</p>
+<dl><dt>十字キー</dt><dd>矢印キー</dd><dt>A / B</dt><dd>X / Z</dd><dt>スタート</dt><dd>Enter</dd><dt>セレクト</dt><dd>Shift</dd></dl>
+</main>
+<script>
+const $=i=>document.getElementById(i),msg=s=>$('m').textContent=s;
+const cx=$('s').getContext('2d'),im=cx.createImageData(256,240),fb=new Uint32Array(im.data.buffer);
+const PAL=[0x666666,0x002A88,0x1412A7,0x3B00A4,0x5C007E,0x6E0040,0x6C0600,0x561D00,0x333500,0x0B4800,0x005200,0x004F08,0x00404D,0,0,0,
+0xADADAD,0x155FD9,0x4240FF,0x7527FE,0xA01ACC,0xB71E7B,0xB53120,0x994E00,0x6B6D00,0x388700,0x0C9300,0x008F32,0x007C8D,0,0,0,
+0xFFFEFF,0x64B0FF,0x9290FF,0xC676FF,0xF36AFF,0xFE6ECC,0xFE8170,0xEA9E22,0xBCBE00,0x88D800,0x5CE430,0x45E082,0x48CDDE,0x4F4F4F,0,0,
+0xFFFEFF,0xC0DFFF,0xD3D2FF,0xE8C8FF,0xFBC2FF,0xFEC4EA,0xFECCC5,0xF7D8A5,0xE4E594,0xCFEF96,0xBDF4AB,0xB3F3CC,0xB5EBF2,0xB8B8B8,0,0]
+.map(c=>0xff000000|(c&255)<<16|(c>>8&255)<<8|c>>16);
+// ---- state
+const ram=new Uint8Array(2048),vram=new Uint8Array(2048),pal=new Uint8Array(32),oam=new Uint8Array(256),sram=new Uint8Array(8192),bo=new Uint8Array(256),lay=new Uint8Array(61440);
+let prg,chr,chrRam,mp,mir,p0,p1,c0,c1,rg,ms,mn,pb,cb,running=false;
+let A,X,Y,S,P,pc,cyc,cya,nmiP,ctrl,mask,st,v,t,fx,w,buf,oa,pad=0,strobe,cs;
+// ---- mapper
+function mw0(a,val){const n=prg.length;
+ if(mp==1){if(val&128){ms=0;mn=0;rg[0]|=12}else{ms|=(val&1)<<mn;if(++mn==5){rg[a>>13&3]=ms;ms=0;mn=0}}
+  const c=rg[0],m=c>>2&3,p=rg[3]&15;mir=[2,3,1,0][c&3];
+  if(m<2){p0=(p&14)<<14;p1=p0+16384}else if(m==2){p0=0;p1=p<<14}else{p0=p<<14;p1=n-16384}
+  if(c&16){c0=rg[1]<<12;c1=rg[2]<<12}else{c0=(rg[1]&30)<<12;c1=c0+4096}}
+ else if(mp==2)p0=(val&15)<<14;
+ else if(mp==3){c0=(val&3)<<13;c1=c0+4096}
+ else if(mp==7){p0=(val&7)<<15;p1=p0+16384;mir=2+(val>>4&1)}}
+let rg4=[0,2,4,5,6,7,0,1],bs=0,il=0,ic=0,ir=0,ie=0,iq=0;
+const sync=()=>{pb=[p0,p0+8192,p1,p1+8192];cb=[0,1,2,3,4,5,6,7].map(i=>(i<4?c0:c1)+(i&3)*1024)};
+function clk3(){if(ic==0||ir){ic=il;ir=0}else ic--;if(ic==0&&ie)iq=1}
+function m3(a,val){const n8=prg.length>>13,R=rg4;
+ if(a<0xa000){if(a&1)R[bs&7]=val;else bs=val}
+ else if(a<0xc000){if(!(a&1)&&mp==4)mir=val&1?0:1}
+ else if(a<0xe000){if(a&1){ic=0;ir=1}else il=val}
+ else{ie=a&1;if(!ie)iq=0}
+ const B=i=>(i%n8)<<13;
+ pb=bs&64?[B(n8-2),B(R[7]),B(R[6]),B(n8-1)]:[B(R[6]),B(R[7]),B(n8-2),B(n8-1)];
+ const k=[R[0]&254,R[0]|1,R[1]&254,R[1]|1,R[2],R[3],R[4],R[5]];
+ cb=(bs&128?k.slice(4).concat(k.slice(0,4)):k).map(x=>(x%(chr.length>>10))<<10)}
+function mw(a,val){
+ if(mp==4||mp==206)return m3(a,val);
+ if(mp==66){p0=(val>>4&3)<<15;p1=p0+16384;c0=(val&3)<<13;c1=c0+4096}
+ else if(mp==11){p0=(val&3)<<15;p1=p0+16384;c0=(val>>4)<<13;c1=c0+4096}
+ else if(mp==34){p0=val<<15;p1=p0+16384}
+ else if(mp==71){if(a>=0xc000)p0=(val&15)<<14}
+ else mw0(a,val);
+ sync()}
+// ---- bus
+function rd(a){a&=65535;
+ if(a<0x2000)return ram[a&2047];
+ if(a<0x4000)return rp(a&7);
+ if(a>=0x8000)return prg[(pb[a>>13&3]+(a&8191))%prg.length];
+ if(a>=0x6000)return sram[a&8191];
+ if(a==0x4015)return ch.reduce((s,c,k)=>s|(c.len>0)<<k,0);
+ if(a==0x4016){if(strobe)cs=pad;const r=cs&1;cs=cs>>1|128;return r|64}
+ return 0}
+function wr(a,val){a&=65535;
+ if(a<0x2000)ram[a&2047]=val;
+ else if(a<0x4000)wp(a&7,val);
+ else if(a>=0x8000)mw(a,val);
+ else if(a>=0x6000)sram[a&8191]=val;
+ else if(a==0x4014){const b=val<<8;for(let i=0;i<256;i++)oam[oa+i&255]=rd(b+i);cyc-=513}
+ else if(a==0x4016){strobe=val&1;if(strobe)cs=pad}else if(a<0x4014||a==0x4015)aw(a,val)}
+// ---- PPU
+const cm=a=>(cb[a>>10&7]+(a&1023))%chr.length;
+const nt=a=>{const n=a>>10&3;return(mir==0?n>>1:mir==1?n&1:mir-2)<<10|a&1023};
+const pi=a=>{a&=31;return(a&19)==16?a&15:a};
+const pr=a=>{a&=16383;return a<0x2000?chr[cm(a)]:a<0x3f00?vram[nt(a)]:pal[pi(a)]};
+function pw(a,val){a&=16383;if(a<0x2000){if(chrRam)chr[cm(a)]=val}else if(a<0x3f00)vram[nt(a)]=val;else pal[pi(a)]=val&63}
+function rp(r){if(r==2){const s=st;st&=127;w=0;return s}
+ if(r==4)return oam[oa];
+ if(r==7){const a=v&16383;let o=buf;buf=pr(a>=0x3f00?a-4096:a);if(a>=0x3f00)o=pr(a);v=v+(ctrl&4?32:1)&32767;return o}
+ return 0}
+function wp(r,val){
+ if(r==0){if(val&128&&!(ctrl&128)&&st&128)nmiP=1;ctrl=val;t=t&0x73ff|(val&3)<<10}
+ else if(r==1)mask=val;
+ else if(r==3)oa=val;
+ else if(r==4)oam[oa++&255]=val,oa&=255;
+ else if(r==5){if(!w){t=t&0x7fe0|val>>3;fx=val&7}else t=t&0x0c1f|(val&7)<<12|(val&0xf8)<<2;w^=1}
+ else if(r==6){if(!w)t=t&255|(val&63)<<8;else{t=t&0x7f00|val;v=t}w^=1}
+ else if(r==7){pw(v,val);v=v+(ctrl&4?32:1)&32767}}
+function line(y){
+ const o=y*256;let hx=999;
+ fb.fill(PAL[pal[0]&63],o,o+256);bo.fill(0);lay.fill(0,o,o+256);
+ if(mask&8){const fy=v>>12&7,cy=v>>5&31,n=v>>10&3,B=ctrl&16?4096:0;
+  for(let i=0;i<33;i++){let c=(v&31)+i;const nn=n^(c>>5&1);c&=31;
+   const tl=vram[nt(0x2000|nn<<10|cy<<5|c)],at=vram[nt(0x23c0|nn<<10|(cy>>2)<<3|c>>2)],pl=at>>((cy&2)<<1|c&2)&3,ad=B+tl*16+fy,lo=chr[cm(ad)],hi=chr[cm(ad+8)];
+   for(let b=0;b<8;b++){const x=i*8+b-fx;if(x<0||x>255)continue;const q=lo>>(7-b)&1|(hi>>(7-b)&1)<<1;
+    if(q&&(x>=8||mask&2)){bo[x]=q;lay[o+x]=2;fb[o+x]=PAL[pal[pl*4+q]&63]}}}}
+ if(mask&16){const h=ctrl&32?16:8,L=[];
+  for(let i=0;i<64&&L.length<8;i++){const r=y-oam[i*4]-1;if(r>=0&&r<h)L.push(i)}
+  for(let k=L.length-1;k>=0;k--){const i=L[k],tl=oam[i*4+1],at=oam[i*4+2],sx=oam[i*4+3],r0=y-oam[i*4]-1,r=at&128?h-1-r0:r0;
+   const ad=h==8?(ctrl&8?4096:0)+tl*16+r:(tl&1)*4096+(tl&254)*16+(r&8)*2+(r&7),lo=chr[cm(ad)],hi=chr[cm(ad+8)];
+   for(let b=0;b<8;b++){const x=sx+b;if(x>255)break;const s=at&64?b:7-b,q=lo>>s&1|(hi>>s&1)<<1;
+    if(!q||(x<8&&!(mask&4)))continue;
+    if(i==0&&bo[x]&&x<255&&x<hx)hx=x;
+    if(!(at&32&&bo[x])){fb[o+x]=PAL[pal[16+(at&3)*4+q]&63];lay[o+x]=at&32?1:4}}}}
+ return hx}
+function incY(){if((v&0x7000)!=0x7000)v+=0x1000;else{v&=0x8fff;let y=(v&0x3e0)>>5;if(y==29){y=0;v^=0x800}else if(y==31)y=0;else y++;v=v&~0x3e0|y<<5}}
+function frame(){
+ for(let l=0;l<262;l++){let hx=999;
+  if(l==241){st|=128;if(ctrl&128)nmiP=1}
+  if(l==261){st&=0x1f;if(mask&24)v=v&0x841f|t&0x7be0}
+  if(l<240){hx=line(l);if(mask&24){incY();v=v&0xfbe0|t&0x41f}}
+  if(mp==4&&mask&24&&(l<240||l==261))clk3();
+  cya+=113.667;const n=cya|0;cya-=n;
+  if(hx<256){const k=Math.min(n,hx/3|0);run(k);st|=64;run(n-k)}else run(n)}
+ cx.putImageData(im,0,0)}
+// ---- APU (パルス2 / 三角波 / ノイズ。DMCは未実装)
+const LN=[10,254,20,2,40,4,80,6,160,8,60,10,14,12,26,14,12,16,24,18,48,20,96,22,192,24,72,26,16,28,32,30],
+DU=[[0,1,0,0,0,0,0,0],[0,1,1,0,0,0,0,0],[0,1,1,1,1,0,0,0],[1,0,0,1,1,1,1,1]],
+NP=[4,8,16,32,64,96,128,160,202,254,380,508,762,1016,2034,4068];
+const mk=()=>({on:0,len:0,halt:0,cv:0,vol:0,ev:0,ec:0,es:0,tm:0,ph:0,duty:0,sen:0,sper:0,sneg:0,ssh:0,scnt:0,srl:0});
+const ch=[mk(),mk(),mk(),mk()];
+let lr=0,lc=0,lrv=0,ns=1,nm=0,npd=4,nacc=0,ac,sr=44100,nt0=0,mute=false;
+$('bm').onclick=()=>{mute=!mute;$('bm').textContent=mute?'音 OFF':'音 ON';$('bm').setAttribute('aria-pressed',String(!mute))};
+function aw(a,val){const r=a&3;
+ if(a<0x4008){const c=ch[a>>2&1];
+  if(r==0){c.duty=val>>6;c.halt=val>>5&1;c.cv=val>>4&1;c.vol=val&15}
+  else if(r==1){c.sen=val>>7;c.sper=val>>4&7;c.sneg=val>>3&1;c.ssh=val&7;c.srl=1}
+  else if(r==2)c.tm=c.tm&0x700|val;
+  else{c.tm=c.tm&255|(val&7)<<8;if(c.on)c.len=LN[val>>3];c.ph=0;c.es=1}}
+ else if(a<0x400c){const c=ch[2];
+  if(r==0){c.halt=val>>7;lrv=val&127}else if(r==2)c.tm=c.tm&0x700|val;
+  else if(r==3){c.tm=c.tm&255|(val&7)<<8;if(c.on)c.len=LN[val>>3];lr=1}}
+ else if(a<0x4010){const c=ch[3];
+  if(r==0){c.halt=val>>5&1;c.cv=val>>4&1;c.vol=val&15}
+  else if(r==2){nm=val>>7;npd=NP[val&15]}
+  else if(r==3){if(c.on)c.len=LN[val>>3];c.es=1}}
+ else if(a==0x4015)for(let k=0;k<4;k++){ch[k].on=val>>k&1;if(!ch[k].on)ch[k].len=0}}
+function aclk(k){
+ for(const j of [0,1,3]){const c=ch[j];
+  if(c.es){c.es=0;c.ev=15;c.ec=c.vol}else if(c.ec==0){c.ec=c.vol;if(c.ev)c.ev--;else if(c.halt)c.ev=15}else c.ec--}
+ if(lr)lc=lrv;else if(lc)lc--;
+ if(!ch[2].halt)lr=0;
+ if(k&1)for(let j=0;j<4;j++){const c=ch[j];if(!c.halt&&c.len)c.len--;
+  if(j<2){const d=c.tm>>c.ssh,g=c.tm+(c.sneg?-d-(j?0:1):d);
+   if(!c.scnt&&c.sen&&c.ssh&&c.tm>=8&&g>=0&&g<=2047)c.tm=g;
+   if(!c.scnt||c.srl){c.scnt=c.sper;c.srl=0}else c.scnt--}}}
+function snd(){
+ if(!ac||mute)return;
+ const N=Math.round(sr/60),b=ac.createBuffer(1,N,sr),o=b.getChannelData(0),cps=1789773/sr,q=N>>2,T=ch[2],Z=ch[3];
+ for(let i=0;i<N;i++){
+  if(i%q==0&&i/q<4)aclk(i/q);
+  let s=0;
+  for(let j=0;j<2;j++){const c=ch[j];c.ph=(c.ph+cps/(2*(c.tm+1)))%8;
+   if(c.len&&c.tm>=8&&(c.sneg||c.tm+(c.tm>>c.ssh)<=2047))s+=.00752*DU[c.duty][c.ph|0]*(c.cv?c.vol:c.ev)}
+  T.ph=(T.ph+cps/(T.tm+1))%32;
+  if(T.len&&lc&&T.tm>1)s+=.00851*(T.ph<16?15-(T.ph|0):(T.ph|0)-16);
+  nacc+=cps;while(nacc>=npd){nacc-=npd;ns=ns>>1|((ns&1)^(nm?ns>>6&1:ns>>1&1))<<14}
+  if(!(ns&1)&&Z.len)s+=.00494*(Z.cv?Z.vol:Z.ev);
+  o[i]=s*1.6}
+ if(nt0>ac.currentTime+.25)return;
+ if(nt0<ac.currentTime)nt0=ac.currentTime+.06;
+ const x=ac.createBufferSource();x.buffer=b;x.connect(ac.destination);x.start(nt0);nt0+=N/sr}
+// ---- CPU
+const sNZ=x=>{P=P&0x7d|x&128|(x&255?0:2);return x&255};
+const push=x=>{wr(256|S,x);S=S-1&255},pop=()=>{S=S+1&255;return rd(256|S)};
+function adc(m){const r=A+m+(P&1);P=P&0xbe|r>>8&1|((~(A^m)&(A^r)&128)?64:0);A=sNZ(r)}
+function cmp(a,m){const r=a-m;P=P&0xfe|(r>=0?1:0);sNZ(r)}
+function shf(k,x){let c;if(k==0){c=x>>7;x<<=1}else if(k==1){c=x>>7;x=x<<1|P&1}else if(k==2){c=x&1;x>>=1}else{c=x&1;x=x>>1|(P&1)<<7}P=P&0xfe|c;return sNZ(x)}
+function ea(m){let p;switch(m){
+ case 0:return pc++;
+ case 1:return rd(pc++);
+ case 2:return rd(pc++)+X&255;
+ case 3:return rd(pc++)+Y&255;
+ case 4:p=rd(pc)|rd(pc+1)<<8;pc+=2;return p;
+ case 5:p=rd(pc)|rd(pc+1)<<8;pc+=2;return p+X&65535;
+ case 6:p=rd(pc)|rd(pc+1)<<8;pc+=2;return p+Y&65535;
+ case 7:p=rd(pc++)+X&255;return rd(p)|rd(p+1&255)<<8;
+ default:p=rd(pc++);return(rd(p)|rd(p+1&255)<<8)+Y&65535}}
+const MC=[0,1,2,2,2,2,2,4,3];
+function run(c){cyc+=c;while(cyc>0)step()}
+function step(){
+ if(nmiP){nmiP=0;push(pc>>8);push(pc&255);push(P&0xef|0x20);P|=4;pc=rd(0xfffa)|rd(0xfffb)<<8;cyc-=7;return}
+ if(iq&&!(P&4)){push(pc>>8);push(pc&255);push(P&0xef|0x20);P|=4;pc=rd(0xfffe)|rd(0xffff)<<8;cyc-=7;return}
+ const op=rd(pc++),cc=op&3,bb=op>>2&7,aa=op>>5;let a,m,val;cyc-=2;
+ if((op&31)==16){const f=[128,64,1,2][aa>>1],r=rd(pc++);if(((P&f)?1:0)==(aa&1)){cyc--;pc=pc+(r<<24>>24)&65535}pc&=65535;return}
+ switch(op){
+  case 0:pc++;push(pc>>8);push(pc&255);push(P|0x30);P|=4;pc=rd(0xfffe)|rd(0xffff)<<8;cyc-=5;return;
+  case 0x20:a=rd(pc)|rd(pc+1)<<8;pc++;push(pc>>8);push(pc&255);pc=a;cyc-=4;return;
+  case 0x40:P=pop()&0xef|0x20;pc=pop()|pop()<<8;cyc-=4;return;
+  case 0x60:pc=(pop()|pop()<<8)+1&65535;cyc-=4;return;
+  case 0x08:push(P|0x30);cyc--;return;
+  case 0x28:P=pop()&0xef|0x20;cyc-=2;return;
+  case 0x48:push(A);cyc--;return;
+  case 0x68:A=sNZ(pop());cyc-=2;return;
+  case 0x88:Y=sNZ(Y-1);return;case 0xa8:Y=sNZ(A);return;case 0xc8:Y=sNZ(Y+1);return;case 0xe8:X=sNZ(X+1);return;
+  case 0x98:A=sNZ(Y);return;case 0x8a:A=sNZ(X);return;case 0x9a:S=X;return;case 0xaa:X=sNZ(A);return;
+  case 0xba:X=sNZ(S);return;case 0xca:X=sNZ(X-1);return;case 0xea:return;
+  case 0x18:P&=~1;return;case 0x38:P|=1;return;case 0x58:P&=~4;return;case 0x78:P|=4;return;
+  case 0xb8:P&=~64;return;case 0xd8:P&=~8;return;case 0xf8:P|=8;return}
+ if(cc==3)return;
+ if(cc==1){m=[7,1,0,4,8,2,6,5][bb];a=ea(m);cyc-=MC[m];
+  if(aa==4){if(m)wr(a,A);return}
+  val=rd(a);
+  switch(aa){case 0:A=sNZ(A|val);break;case 1:A=sNZ(A&val);break;case 2:A=sNZ(A^val);break;case 3:adc(val);break;case 5:A=sNZ(val);break;case 6:cmp(A,val);break;default:adc(val^255)}
+  return}
+ if(cc==2){
+  if(bb==2){A=shf(aa,A);return}
+  m=[0,1,0,4,0,(op==0x96||op==0xb6)?3:2,0,op==0xbe?6:5][bb];a=ea(m);cyc-=MC[m]+(aa>=4&&aa<6?0:2);
+  switch(aa){case 4:wr(a,X);break;case 5:X=sNZ(rd(a));break;case 6:wr(a,sNZ(rd(a)-1));break;case 7:wr(a,sNZ(rd(a)+1));break;default:wr(a,shf(aa,rd(a)))}
+  return}
+ if(op==0x4c){pc=rd(pc)|rd(pc+1)<<8;cyc--;return}
+ if(op==0x6c){const p=rd(pc)|rd(pc+1)<<8;pc=rd(p)|rd(p&0xff00|p+1&255)<<8;cyc-=3;return}
+ m=[0,1,0,4,0,2,0,5][bb];a=ea(m);cyc-=MC[m];
+ switch(aa){case 1:val=rd(a);P=P&0x3d|val&0xc0|(A&val?0:2);break;case 4:wr(a,Y);break;case 5:Y=sNZ(rd(a));break;case 6:cmp(Y,rd(a));break;case 7:cmp(X,rd(a))}}
+// ---- ROM / UI
+async function load(f){
+ const d=new Uint8Array(await f.arrayBuffer());
+ if(d[0]!=78||d[1]!=69||d[2]!=83||d[3]!=26){running=false;return msg('NES ROM（iNES形式）ではありません。')}
+ const np=d[4],nc=d[5];mp=d[6]>>4|d[7]&240;
+ if(![0,1,2,3,4,7,11,34,66,71,206].includes(mp)){running=false;return msg('マッパー'+mp+'は未対応です（対応: 0, 1, 2, 3, 4, 7, 11, 34, 66, 71, 206）。')}
+ let o=16+(d[6]&4?512:0);prg=d.slice(o,o+np*16384);o+=np*16384;
+ chrRam=!nc;chr=nc?d.slice(o,o+nc*8192):new Uint8Array(8192);
+ ram.fill(0);vram.fill(0);pal.fill(0);oam.fill(0);sram.fill(0);
+ mir=d[6]&1;ctrl=mask=st=0;v=t=fx=w=buf=oa=0;rg=[12,0,0,0];ms=mn=0;c0=0;c1=4096;p0=0;p1=np>1?16384:0;
+ if(mp==2||mp==71)p1=prg.length-16384;if(mp==7){p1=16384;mir=2}
+ il=ic=ir=ie=iq=0;rg4=[0,2,4,5,6,7,0,1];bs=0;
+ if(mp==4||mp==206)m3(0x8000,0);else if(mp==1)mw(0x8000,128);else sync();
+ A=X=Y=0;S=0xfd;P=0x24;nmiP=0;cyc=0;cya=0;strobe=0;cs=0;pc=rd(0xfffc)|rd(0xfffd)<<8;
+ const NM={0:'NROM',1:'MMC1',2:'UxROM',3:'CNROM',4:'MMC3',7:'AxROM',11:'Color Dreams',34:'BNROM',66:'GxROM',71:'Camerica',206:'DxROM'};let ut='';
+ if(nc){const U=new Set;for(let i=0;i+16<=chr.length;i+=16)U.add(chr.slice(i,i+16).join());ut=' / ユニークタイル '+U.size+'/'+chr.length/16}
+ $('i').textContent='PRG '+np*16+'KB / CHR '+(nc?nc*8+'KB':'RAM 8KB')+ut+' / マッパー'+mp+' ('+NM[mp]+') / '+(d[6]&8?'4画面':d[6]&1?'垂直':'水平')+'ミラー'+(d[6]&2?' / バッテリー':'')+((d[7]&12)==8?' / NES 2.0':'');
+ ch.forEach((c,k)=>Object.assign(c,mk()));lr=lc=lrv=0;ns=1;
+ if(!ac)try{ac=new(window.AudioContext||window.webkitAudioContext)();sr=ac.sampleRate}catch(e){}
+ if(ac&&ac.state=='suspended')ac.resume();
+ running=true;msg(f.name+' を実行中')}
+const KM={KeyX:1,KeyZ:2,ShiftLeft:4,ShiftRight:4,Enter:8,ArrowUp:16,ArrowDown:32,ArrowLeft:64,ArrowRight:128};
+addEventListener('keydown',e=>{if(KM[e.code]){pad|=KM[e.code];e.preventDefault()}});
+addEventListener('keyup',e=>{if(KM[e.code]){pad&=~KM[e.code];e.preventDefault()}});
+$('f').onchange=e=>e.target.files[0]&&load(e.target.files[0]);
+const dz=$('dz');
+dz.ondragover=e=>{e.preventDefault();dz.classList.add('on')};
+dz.ondragleave=()=>dz.classList.remove('on');
+addEventListener('dragover',e=>e.preventDefault());
+addEventListener('drop',e=>{e.preventDefault();dz.classList.remove('on');const f=e.dataTransfer.files[0];f&&load(f)});
+// ---- 3D view: 画面を層ごとに押し出す（背景=中, 前面スプライト=高, 背面スプライト=低）
+let v3=false,R,sc,cam,mesh,tcx,tly,ry=0,rx=-.3,zoom=400;
+function init3(){
+ if(!window.THREE){msg('3D 表示には three.js の読み込み（ネット接続）が必要です。');return false}
+ const T=THREE;
+ R=new T.WebGLRenderer({canvas:$('d')});R.setSize(768,720,false);
+ sc=new T.Scene();cam=new T.PerspectiveCamera(40,768/720,1,3000);
+ tcx=new T.DataTexture(new Uint8Array(im.data.buffer),256,240,T.RGBAFormat);
+ tly=new T.DataTexture(lay,256,240,T.LuminanceFormat);
+ const M=new T.ShaderMaterial({uniforms:{tc:{value:tcx},tl:{value:tly}},
+ vertexShader:'uniform sampler2D tc,tl;varying vec3 vc;void main(){vec2 g=instanceMatrix[3].xy;vec2 uv=vec2(g.x+128.,120.-g.y)/vec2(256.,240.);vec3 c=texture2D(tc,uv).rgb;float L=texture2D(tl,uv).r*255.;float h=max(L*3.,.4);vec3 p=position;p.z=(p.z+.5)*h;float l=.55+.45*max(dot(normal,normalize(vec3(.3,.5,1.))),0.);vc=c*l;gl_Position=projectionMatrix*modelViewMatrix*instanceMatrix*vec4(p,1.);}',
+ fragmentShader:'varying vec3 vc;void main(){gl_FragColor=vec4(vc,1.);}'});
+ mesh=new T.InstancedMesh(new T.BoxGeometry(1,1,1),M,61440);mesh.frustumCulled=false;
+ const m=new T.Matrix4();let k=0;
+ for(let r=0;r<240;r++)for(let c=0;c<256;c++){m.setPosition(c-127.5,119.5-r,0);mesh.setMatrixAt(k++,m)}
+ sc.add(mesh);cam.position.set(0,0,zoom);return true}
+function draw3(){tcx.needsUpdate=true;tly.needsUpdate=true;mesh.rotation.set(rx,ry,0);cam.position.z=zoom;R.render(sc,cam)}
+function set3(on){if(on&&!R&&!init3())return;v3=on;$('d').style.display=on?'block':'none';$('s').style.display=on?'none':'block';$('b2').setAttribute('aria-pressed',String(!on));$('b3').setAttribute('aria-pressed',String(on));if(on)draw3()}
+$('b2').onclick=()=>set3(false);$('b3').onclick=()=>set3(true);
+const dc=$('d');let dr=null;
+dc.onpointerdown=e=>{dr=[e.clientX,e.clientY];dc.setPointerCapture(e.pointerId);dc.style.cursor='grabbing'};
+dc.onpointermove=e=>{if(!dr)return;ry+=(e.clientX-dr[0])*.008;rx+=(e.clientY-dr[1])*.008;dr=[e.clientX,e.clientY]};
+dc.onpointerup=()=>{dr=null;dc.style.cursor='grab'};
+dc.onwheel=e=>{e.preventDefault();zoom=Math.max(150,Math.min(900,zoom*(e.deltaY>0?1.08:.92)))};
+let last=0,acc=0;
+function tick(ts){requestAnimationFrame(tick);if(!running){last=ts;if(v3)draw3();return}
+ acc+=Math.min(ts-last,50);last=ts;let n=0;
+ try{while(acc>=16.64&&n++<3){frame();snd();acc-=16.64}}catch(e){running=false;msg('エラー: '+e.message)}if(v3)draw3()}
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
